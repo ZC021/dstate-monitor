@@ -1,0 +1,42 @@
+{
+  "generated_at": "2026-06-09T13:11:00+00:00",
+  "source": "AWX job #1234 (synthetic demo)",
+  "interval_min": 30,
+  "hosts": {
+    "web-01.example.com": {
+      "ansible_host": "10.0.0.11",
+      "rc": 0,
+      "lines": [
+        "RC=0",
+        "LOGINS\t8\talice",
+        "LASTHOST\talice pts/0 10.0.0.50 Mon Jun  9 12:40:00 2026 - still logged in",
+        "D\t12575\t12492\talice\t4200\trpc_wait_bit_killable\tgit status -z -uall",
+        "D\t48997\t1\talice\t3900\td_alloc_parallel\t/usr/bin/git ls-files --others --exclude-standard"
+      ]
+    },
+    "db-01.example.com": {
+      "ansible_host": "10.0.0.21",
+      "rc": 0,
+      "lines": [
+        "RC=0",
+        "LOGINS\t4\tbob",
+        "LASTHOST\tbob pts/1 10.0.0.51 Mon Jun  9 11:15:00 2026 - 11:45 (00:30)"
+      ]
+    },
+    "nfs-01.example.com": {
+      "ansible_host": "10.0.0.31",
+      "rc": 0,
+      "lines": [
+        "RC=0",
+        "D\t331\t2\troot\t900\twait_on_buffer\t[jbd2/sda3-8]",
+        "D\t255638\t1\troot\t600\tjbd2_log_wait_commit\t/usr/lib/systemd/systemd-journald"
+      ]
+    },
+    "batch-01.example.com": {
+      "ansible_host": "10.0.0.41",
+      "rc": 124,
+      "lines": ["RC=124"]
+    }
+  },
+  "unreachable": ["worker-03.example.com"]
+}

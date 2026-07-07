@@ -1,0 +1,32 @@
+# OS/editor
+.DS_Store
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Generated dashboard output
+reports/
+dashboard/report.json
+dashboard/history.jsonl
+dashboard/index.html
+dashboard/index.live.html
+dashboard/*.log
+
+# Local config, tokens, credentials
+.env
+.env.*
+!.env.example
+dashboard/config.env
+secrets/
+*.pem
+*.key
+*.crt
+*.htpasswd
+
+# Local backups/state
+*.bak
+*.bak-*
+*.tmp

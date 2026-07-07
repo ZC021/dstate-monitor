@@ -1,0 +1,9 @@
+---
+all:
+  hosts:
+    web-01.example.com:
+      ansible_host: 10.0.0.11
+    db-01.example.com:
+      ansible_host: 10.0.0.21
+    nfs-01.example.com:
+      ansible_host: 10.0.0.31

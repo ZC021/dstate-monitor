@@ -1,0 +1,55 @@
+---
+# D-State Fleet Scan — read-only uninterruptible-sleep process check.
+#
+# The playbook runs only `ps` and `last`; it does not modify target hosts and
+# does not require root by default. Results are published to AWX job artifacts
+# as `dstate_hosts` for the dashboard puller.
+
+- name: D-state fleet scan (read-only)
+  hosts: "{{ target_host | default('all') }}"
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Collect D-state processes (ps only)
+      shell: |
+        # `ps` itself can hang on a sick host, so protect it with timeout when available.
+        # RC=0: ps completed. RC=124: timeout.
+        if command -v timeout >/dev/null 2>&1; then
+          out=$(LC_ALL=C timeout -k 5s 20s ps -eo stat=,pid=,ppid=,user:24=,etimes=,wchan:64=,args= 2>/dev/null)
+          rc=$?
+        else
+          out=$(LC_ALL=C ps -eo stat=,pid=,ppid=,user:24=,etimes=,wchan:64=,args= 2>/dev/null)
+          rc=$?
+        fi
+        printf 'RC=%s\n' "$rc"
+        # Login hints are optional context for the dashboard. Exclude service accounts.
+        { last -w 2>/dev/null; [ -f /var/log/wtmp.1 ] && last -w -f /var/log/wtmp.1 2>/dev/null; } | awk 'NF>3 && $1 !~ /^(reboot|shutdown|runlevel|wtmp|scanner|ansible)$/ {print $1}' | sort | uniq -c | sort -rn | head -5 | awk '{printf "LOGINS\t%d\t%s\n",$1,$2}'
+        { last -Fw 2>/dev/null; [ -f /var/log/wtmp.1 ] && last -Fw -f /var/log/wtmp.1 2>/dev/null; } | awk 'NF>3 && $1 !~ /^(reboot|shutdown|runlevel|wtmp|scanner|ansible)$/ {print "LASTHOST\t"$0; exit}'
+        printf '%s\n' "$out" | awk '$1 ~ /^D/ {
+          s=$1; p=$2; pp=$3; u=$4; e=$5; w=$6;
+          $1=$2=$3=$4=$5=$6="";
+          sub(/^ +/, "");
+          a=substr($0, 1, 2000);
+          gsub(/(token|password|passwd|secret|api[_-]?key|access[_-]?key|connection-token)[=: ][^ ]*/, "***MASKED***", a);
+          printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s, p, pp, u, e, w, a
+        }'
+        exit 0
+      register: dstate
+      changed_when: false
+      failed_when: false
+
+    - name: Publish per-host D-state summary to job artifacts
+      set_stats:
+        aggregate: true
+        per_host: false
+        data:
+          dstate_hosts: >-
+            {{
+              {
+                inventory_hostname: {
+                  'ansible_host': ansible_host | default(inventory_hostname),
+                  'lines': (dstate.stdout_lines | default([]))[:500]
+                }
+              }
+            }}

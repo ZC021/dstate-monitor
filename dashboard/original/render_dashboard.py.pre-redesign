@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+render_dashboard.py — D-State Fleet Monitor 렌더러 (표준 라이브러리만)
+
+입력  : report.json  (awx_pull.py 가 생성, 또는 테스트용 sample)
+출력  : index.html   (외부 의존성 0, nginx로 그대로 서빙)
+
+report.json 스키마:
+{
+  "generated_at": "2026-06-09T13:11:00+09:00",
+  "source": "AWX job #261",
+  "interval_min": 30,
+  "hosts": {                         # 스캔 성공(reachable) 호스트
+     "web-01.example.com": {"ansible_host":"10.0.1.37","rc":0,
+                  "lines":["RC=0","D\\t12575\\t...\\tgit status -z -uall", ...]}
+  },
+  "unreachable": ["metrics-01.example.com", ...]   # AWX dark (SSH 실패)
+}
+
+핵심 해석(분석에서 도출):
+- etimes = 프로세스 "총 나이"이지 "D로 막힌 시간"이 아니다.
+  → 데몬(node_exporter/vscode-server 등)의 큰 나이는 정상. 무시.
+  → 원래 즉시 끝나야 할 명령(git/ls/du/sync/find/ugrep/stat)이 나이가 크면 = 진짜 그만큼 stuck.
+- 진짜 위험 = (즉시끝날 명령) × (나이 큼) × (wchan=nfs/rpc/vfs).
+"""
+import sys, os, json, re, html, time
+
+STUCK_AGE = 120          # 즉시끝날 명령이 이 초(2분) 넘게 D면 "확실히 stuck"
+RED_STUCK, ORANGE_STUCK = 10, 3
+RED_DCOUNT, ORANGE_DCOUNT, YELLOW_DCOUNT = 20, 5, 1
+
+# 즉시 끝나야 정상인 명령(이게 오래 D면 진짜 hang)
+QUICK_RE = re.compile(r'^\[?(git|/usr/bin/git|/usr/lib/git-core/git|ls|du|find|ugrep|grep|stat|sync|/bin/sync|cat|head|tail|cp|mv|rm)\b', re.I)
+# 토큰/비밀 마스킹
+SENS = re.compile(r'((?:pass(?:word|wd)?|pwd|secret|token|api[-_]?key|access[-_]?key|auth|connection-token)[=\s:]+)\S+', re.I)
+URLCRED = re.compile(r'(://[^:/@\s]+:)[^@/\s]+@')
+
+def redact(s):
+    s = SENS.sub(lambda m: m.group(1).rstrip('=: \t') + '=***', s)
+    s = URLCRED.sub(r'\1***@', s)
+    return s
+
+DISK_STALL = re.compile(r'jbd2|wait_on_buffer|io_schedule|blk_')
+
+def mask_tsv_line(line):
+    """TSV 한 줄의 args 필드만 마스킹(awx_pull 이 report.json 저장 전에 사용 → 원본도 안전)."""
+    if not line or line.startswith('RC=') or '\t' not in line:
+        return line
+    f = line.split('\t')
+    if len(f) < 7:
+        return line
+    return '\t'.join(f[:6] + [redact('\t'.join(f[6:]))])
+
+def wchan_cat(w):
+    if re.search(r'^nfs|nfs_|rpc_wait', w): return ('NFS/RPC', 'nfs')
+    if re.search(r'walk_component|d_alloc|lookup_slow|open_last_lookups|iterate_dir', w): return ('VFS조회(대개NFS)', 'nfs')
+    if re.search(r'page_bit|wait_on_buffer|jbd2|buffered_read|lock_page|nfs_start_io|submit_bio|io_schedule|blk', w): return ('page/디스크', 'disk')
+    if re.search(r'rwsem|mutex|down_', w): return ('lock경합', 'lock')
+    if re.search(r'cv_wait|cv_timedwait|txg', w): return ('ZFS', 'zfs')
+    return ('기타', 'etc')
+
+def human_age(sec):
+    if sec < 0: return '-'
+    d, r = divmod(sec, 86400); h, r = divmod(r, 3600); m, _ = divmod(r, 60)
+    if d: return f'{d}d {h}h'
+    if h: return f'{h}h {m}m'
+    if m: return f'{m}m'
+    return f'{sec}s'
+
+def short_cmd(args):
+    """표시용 짧은 프로그램명."""
+    a = args.strip()
+    if a.startswith('['):  # 커널/데몬 [kworker] 등
+        return a.split()[0]
+    tok = a.split()
+    if not tok: return a
+    prog = tok[0].rsplit('/', 1)[-1]
+    if prog in ('git', '/usr/bin/git') and len(tok) > 1:
+        sub = next((t for t in tok[1:] if not t.startswith('-')), '')
+        return f'git {sub}'.strip()
+    if 'vscode-server' in a or 'server.bundle.js' in a: return 'vscode-server'
+    if 'cursor-server' in a: return 'cursor-server'
+    if prog == 'node': return 'node'
+    return prog
+
+def parse_proc(line):
+    f = line.split('\t')
+    if len(f) < 7: return None
+    stat, pid, ppid, user, et, wchan, args = f[0], f[1], f[2], f[3], f[4], f[5], '\t'.join(f[6:])
+    try: et = int(et)
+    except Exception: et = -1
+    args = redact(args)
+    quick = bool(QUICK_RE.match(args))
+    return {'stat': stat, 'pid': pid, 'ppid': ppid, 'user': user, 'etimes': et,
+            'wchan': wchan, 'args': args, 'quick': quick,
+            'stuck': quick and et > STUCK_AGE}
+
+def host_summary(name, h):
+    rc = h.get('rc')
+    procs = []
+    for ln in h.get('lines', []) or []:
+        if ln.startswith('RC='):
+            try: rc = int(ln[3:].strip())
+            except Exception: pass
+            continue
+        if not ln.strip(): continue
+        p = parse_proc(ln)
+        if p: procs.append(p)
+    dcount = len(procs)
+    stuck = [p for p in procs if p['stuck']]
+    stuck_n = len(stuck)
+    oldest_stuck = max((p['etimes'] for p in stuck), default=-1)
+    # 카테고리 집계
+    cats = {}
+    for p in procs:
+        c, _ = wchan_cat(p['wchan']); cats[c] = cats.get(c, 0) + 1
+    top_cat = max(cats, key=cats.get) if cats else '-'
+    # 상태/심각도
+    if rc == 124:
+        status, sev = 'PS_TIMEOUT', 4
+    elif rc not in (0, None):
+        status, sev = 'SCAN_ERR', 2
+    elif dcount == 0:
+        status, sev = 'OK', 0
+    else:
+        status = 'D'
+        disk_stall = any(DISK_STALL.search(p['wchan']) for p in procs)
+        if stuck_n >= RED_STUCK or dcount >= RED_DCOUNT or oldest_stuck > 3600: sev = 4
+        elif stuck_n >= ORANGE_STUCK or dcount >= ORANGE_DCOUNT or disk_stall: sev = 3
+        else: sev = 2
+        if disk_stall: top_cat = 'page/디스크'   # 로컬 디스크 stall 강조
+    # 대표 프로세스: 가장 오래된 stuck → 없으면 가장 오래된 proc
+    rep = max(stuck, key=lambda p: p['etimes'], default=None) or \
+          (max(procs, key=lambda p: p['etimes']) if procs else None)
+    return {'name': name, 'ansible_host': h.get('ansible_host', name), 'rc': rc,
+            'dcount': dcount, 'stuck_n': stuck_n, 'oldest_stuck': oldest_stuck,
+            'top_cat': top_cat, 'status': status, 'sev': sev,
+            'rep': (short_cmd(rep['args']) if rep else '-'),
+            'rep_user': (rep['user'] if rep else ''), 'procs': procs, 'cats': cats}
+
+SEV_CLASS = {0: 'ok', 2: 'warn', 3: 'high', 4: 'crit'}
+SEV_DOT = {0: '🟢', 2: '🟡', 3: '🟠', 4: '🔴'}
+
+def build(report):
+    hosts = report.get('hosts', {})
+    unreachable = sorted(report.get('unreachable', []) or [])
+    rows = [host_summary(n, h) for n, h in hosts.items()]
+    scanned = len(rows)
+    affected = sum(1 for r in rows if r['dcount'] > 0)
+    total_d = sum(r['dcount'] for r in rows)
+    total_stuck = sum(r['stuck_n'] for r in rows)
+    # 카테고리 전체 집계
+    catall = {}
+    for r in rows:
+        for c, n in r['cats'].items(): catall[c] = catall.get(c, 0) + n
+    cat_sorted = sorted(catall.items(), key=lambda kv: -kv[1])
+    cat_total = sum(catall.values()) or 1
+    # 정렬: 심각도desc, stuck desc, dcount desc
+    rows.sort(key=lambda r: (-r['sev'], -r['stuck_n'], -r['dcount'], r['name']))
+
+    def esc(x): return html.escape(str(x))
+    gen = esc(report.get('generated_at', '-'))
+    src = esc(report.get('source', '-'))
+    iv = esc(report.get('interval_min', 30))
+
+    bars = ''.join(
+        f'<span class="cb cb-{wchan_cat_key(c)}" title="{esc(c)}: {n}">{esc(c)} {n}</span>'
+        for c, n in cat_sorted[:6])
+
+    tr = []
+    for i, r in enumerate(rows):
+        cls = SEV_CLASS.get(r['sev'], 'ok')
+        det = ''
+        if r['procs']:
+            lis = ''.join(
+                f"<div class='p {'stuck' if p['stuck'] else ''}'>"
+                f"<span class='pg'>{esc(human_age(p['etimes']))}</span>"
+                f"<span class='pw'>{esc(p['wchan'])}</span>"
+                f"<span class='pu'>{esc(p['user'])}</span>"
+                f"<span class='pc'>{esc(p['args'][:300])}</span></div>"
+                for p in sorted(r['procs'], key=lambda p: (not p['stuck'], -p['etimes'])))
+            det = f"<details><summary>{r['dcount']}개 보기</summary><div class='plist'>{lis}</div></details>"
+        else:
+            det = '—'
+        tr.append(
+            f"<tr class='{cls}' data-host='{esc(r['name'])}' data-sev='{r['sev']}' "
+            f"data-stuck='{r['stuck_n']}' data-d='{r['dcount']}' data-age='{r['oldest_stuck']}'>"
+            f"<td class='st'>{SEV_DOT.get(r['sev'],'🟢')} {esc(r['status'])}</td>"
+            f"<td class='h'>{esc(r['name'])}<button class='rb' onclick=\"rescan(this,'{esc(r['name'])}')\" title='이 호스트만 지금 재스캔(v2)'>↻</button></td>"
+            f"<td class='ip'>{esc(r['ansible_host'])}</td>"
+            f"<td class='n'>{r['dcount'] or ''}</td>"
+            f"<td class='n stuckn'>{r['stuck_n'] or ''}</td>"
+            f"<td class='cat'>{esc(r['top_cat']) if r['dcount'] else ''}</td>"
+            f"<td class='age'>{esc(human_age(r['oldest_stuck'])) if r['stuck_n'] else ''}</td>"
+            f"<td class='rep'>{esc(r['rep']) if r['dcount'] else ''}"
+            f"<span class='ru'>{esc(r['rep_user'])}</span></td>"
+            f"<td class='det'>{det}</td></tr>")
+    # unreachable 행
+    for u in unreachable:
+        tr.append(
+            f"<tr class='crit unreach' data-host='{esc(u)}' data-sev='5' data-stuck='0' data-d='0' data-age='-1'>"
+            f"<td class='st'>🔴 UNREACHABLE</td><td class='h'>{esc(u)}</td>"
+            f"<td class='ip'>-</td><td class='n'></td><td class='n'></td>"
+            f"<td class='cat'>SSH 응답없음</td><td class='age'></td>"
+            f"<td class='rep'>(꺼짐/네트워크/완전hang 확인)</td><td class='det'>—</td></tr>")
+
+    return PAGE.format(
+        gen=gen, src=src, iv=iv,
+        scanned=scanned, affected=affected, unreach=len(unreachable),
+        total_d=total_d, total_stuck=total_stuck,
+        bars=bars, rows='\n'.join(tr))
+
+def wchan_cat_key(c):
+    return {'NFS/RPC': 'nfs', 'VFS조회(대개NFS)': 'nfs', 'page/디스크': 'disk',
+            'lock경합': 'lock', 'ZFS': 'zfs'}.get(c, 'etc')
+
+PAGE = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="300">
+<title>D-State Fleet Monitor</title>
+<style>
+*{{box-sizing:border-box}} body{{margin:0;background:#0f1419;color:#d6dde6;
+font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}}
+header{{padding:14px 18px;border-bottom:1px solid #2a3340;display:flex;
+justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px}}
+h1{{font-size:16px;margin:0}} .meta{{color:#7b8794;font-size:12px}}
+.cards{{display:flex;gap:10px;padding:14px 18px;flex-wrap:wrap}}
+.card{{background:#1a2029;border:1px solid #2a3340;border-radius:8px;padding:10px 14px;min-width:120px}}
+.card .v{{font-size:24px;font-weight:700}} .card .l{{color:#7b8794;font-size:11px}}
+.card.red .v{{color:#ff6b6b}} .card.org .v{{color:#ffa94d}} .card.grn .v{{color:#51cf66}}
+.bars{{padding:0 18px 10px;display:flex;gap:6px;flex-wrap:wrap}}
+.cb{{font-size:11px;padding:3px 8px;border-radius:10px;background:#222b36;border:1px solid #2a3340}}
+.cb-nfs{{border-color:#9775fa;color:#b197fc}} .cb-disk{{border-color:#ffa94d;color:#ffc078}}
+.cb-lock{{border-color:#4dabf7;color:#74c0fc}} .cb-zfs{{border-color:#38d9a9;color:#63e6be}}
+.tools{{padding:0 18px 10px}} input#f{{background:#1a2029;border:1px solid #2a3340;
+color:#d6dde6;padding:7px 10px;border-radius:6px;width:280px}}
+table{{width:100%;border-collapse:collapse;font-size:12.5px}}
+th,td{{text-align:left;padding:6px 10px;border-bottom:1px solid #222b36;vertical-align:top}}
+th{{color:#7b8794;font-weight:600;cursor:pointer;position:sticky;top:0;background:#0f1419;user-select:none}}
+td.n,td.age{{text-align:right;font-variant-numeric:tabular-nums}}
+td.h{{font-weight:600}} td.ip{{color:#7b8794;font-family:ui-monospace,monospace}}
+td.rep{{color:#aeb6c0}} .ru{{color:#7b8794;margin-left:8px;font-size:11px}}
+td.stuckn{{color:#ff6b6b;font-weight:700}}
+tr.ok td.st{{color:#51cf66}} tr.warn{{background:#1a1d12}} tr.warn td.st{{color:#ffd43b}}
+tr.high{{background:#241a10}} tr.high td.st{{color:#ffa94d}}
+tr.crit{{background:#2a1416}} tr.crit td.st{{color:#ff6b6b;font-weight:700}}
+.rb{{margin-left:8px;background:#222b36;border:1px solid #2a3340;color:#74c0fc;
+border-radius:4px;cursor:pointer;font-size:11px;padding:1px 6px}}
+.rb:hover{{background:#2a3744}}
+details summary{{cursor:pointer;color:#74c0fc;font-size:11px}}
+.plist{{margin:6px 0;max-height:340px;overflow:auto;border-left:2px solid #2a3340;padding-left:8px}}
+.p{{display:grid;grid-template-columns:64px 190px 120px 1fr;gap:8px;padding:2px 0;
+border-bottom:1px solid #1a2029;font-family:ui-monospace,monospace;font-size:11px;color:#9aa4af}}
+.p.stuck{{color:#ffb3b3}} .p .pg{{color:#ffa94d;text-align:right}} .p .pw{{color:#b197fc}}
+.note{{padding:10px 18px;color:#7b8794;font-size:11.5px;border-top:1px solid #2a3340}}
+</style></head><body>
+<header><div><h1>🖥 D-State Fleet Monitor</h1>
+<div class="meta">소스 {src} · 스캔 {gen} · 자동새로고침 5분 · 주기 {iv}분</div></div></header>
+<div class="cards">
+ <div class="card"><div class="v">{scanned}</div><div class="l">스캔 호스트</div></div>
+ <div class="card org"><div class="v">{affected}</div><div class="l">D 발생 호스트</div></div>
+ <div class="card red"><div class="v">{unreach}</div><div class="l">도달불가(SSH)</div></div>
+ <div class="card"><div class="v">{total_d}</div><div class="l">총 D 프로세스</div></div>
+ <div class="card red"><div class="v">{total_stuck}</div><div class="l">확실히 stuck<br>(즉시명령·2분+)</div></div>
+</div>
+<div class="bars">{bars}</div>
+<div class="tools"><input id="f" placeholder="호스트 필터 (예: web-01.example.com, compute)" oninput="flt()"></div>
+<table id="t"><thead><tr>
+<th onclick="srt(1,'s')">상태</th><th onclick="srt(1,'t')">호스트</th><th>IP</th>
+<th onclick="srt(0,'d')">D수</th><th onclick="srt(0,'k')">stuck</th>
+<th>주원인</th><th onclick="srt(0,'a')">최고령 stuck</th><th>대표 프로세스</th><th>상세</th>
+</tr></thead><tbody>
+{rows}
+</tbody></table>
+<div class="note">⚠ "최고령 stuck"은 <b>즉시 끝나야 할 명령(git/ls/du/sync 등)이 D로 머문 나이</b>입니다.
+데몬(node/vscode-server 등)의 큰 나이는 정상 수명이라 stuck 계산에서 제외했습니다.
+주원인이 NFS/VFS면 NFS 서버·마운트를, page/디스크면 해당 호스트 dmesg·smartctl·df 를 보세요. D 프로세스는 kill 안 됨 → 근본원인 회복 필요.</div>
+<script>
+function flt(){{var q=document.getElementById('f').value.toLowerCase();
+document.querySelectorAll('#t tbody tr').forEach(function(r){{
+ r.style.display=r.getAttribute('data-host').toLowerCase().indexOf(q)>=0?'':'none';}});}}
+function srt(txt,key){{var tb=document.querySelector('#t tbody');
+var rs=[].slice.call(tb.querySelectorAll('tr'));
+var m={{s:'data-sev',t:'data-host',d:'data-d',k:'data-stuck',a:'data-age'}};
+var a=m[key];window._d=!window._d;var dir=window._d?1:-1;
+rs.sort(function(x,y){{var vx=x.getAttribute(a),vy=y.getAttribute(a);
+ if(txt){{return dir*vx.localeCompare(vy);}}
+ return dir*((+vx)-(+vy));}});
+rs.forEach(function(r){{tb.appendChild(r);}});}}
+function rescan(btn,host){{var o=btn.textContent;btn.textContent='…';btn.disabled=true;
+fetch('api/rescan',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{host:host}})}}).then(function(r){{return r.json();}}).then(function(d){{
+ var tr=btn.closest('tr');
+ if(d.error){{btn.textContent='!';btn.title=d.error;btn.disabled=false;return;}}
+ if(d.unreachable){{tr.querySelector('.st').textContent='🔴 UNREACHABLE';btn.textContent='↻';btn.disabled=false;return;}}
+ var lines=(d.data&&d.data.lines)||[];
+ var dc=lines.filter(function(l){{return l.indexOf('\\t')>=0;}}).length;
+ var nc=tr.querySelector('.n');if(nc)nc.textContent=dc||'';
+ btn.textContent=(d.timeout?'…⏱':'✓')+'('+dc+')';btn.disabled=false;
+}}).catch(function(e){{btn.textContent='!';btn.title=''+e;btn.disabled=false;}});}}
+</script></body></html>"""
+
+def main():
+    rp = sys.argv[1] if len(sys.argv) > 1 else 'report.json'
+    out = sys.argv[2] if len(sys.argv) > 2 else 'index.html'
+    with open(rp, encoding='utf-8') as f:
+        report = json.load(f)
+    htmlout = build(report)
+    with open(out, 'w', encoding='utf-8') as f:
+        f.write(htmlout)
+    h = report.get('hosts', {})
+    print(f"rendered {out}  (hosts={len(h)} unreachable={len(report.get('unreachable',[]))})")
+
+if __name__ == '__main__':
+    main()

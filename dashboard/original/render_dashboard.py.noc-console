@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+render_dashboard.py — D-State Fleet Monitor 렌더러 (표준 라이브러리만, 오프라인 안전)
+디자인: 다크 "NOC 콘솔" — 모노스페이스 중심 · 시안 브랜드 · 시맨틱 severity · 서브틀 그리드/글로우.
+입력 report.json → 자기완결 index.html (외부 폰트/JS/CDN 0).
+
+해석 원칙: etimes = 프로세스 "나이" ≠ "D 대기시간".
+  데몬(node/vscode-server)의 큰 나이는 정상 → stuck 제외.
+  즉시 끝나야 할 명령(git/ls/du/sync)이 나이 크면 = 진짜 stuck.
+주 사용자: report lines 의 USERS\\t<수>\\t<유저>(프로세스 최다 소유자), WHO\\t<유저>(로그인).
+  없으면 D-state 프로세스 소유자로 폴백.
+"""
+import sys, os, json, re, html
+
+STUCK_AGE = 120
+RED_STUCK, ORANGE_STUCK = 10, 3
+RED_DCOUNT, ORANGE_DCOUNT = 20, 5
+
+QUICK_RE = re.compile(r'^\[?(git|/usr/bin/git|/usr/lib/git-core/git|ls|du|find|ugrep|grep|stat|sync|/bin/sync|cat|head|tail|cp|mv|rm)\b', re.I)
+SENS = re.compile(r'((?:pass(?:word|wd)?|pwd|secret|token|api[-_]?key|access[-_]?key|auth|connection-token)[=\s:]+)\S+', re.I)
+URLCRED = re.compile(r'(://[^:/@\s]+:)[^@/\s]+@')
+DISK_STALL = re.compile(r'jbd2|wait_on_buffer|io_schedule|blk_')
+
+
+def redact(s):
+    s = SENS.sub(lambda m: m.group(1).rstrip('=: \t') + '=***', s)
+    return URLCRED.sub(r'\1***@', s)
+
+
+def mask_tsv_line(line):
+    if not line or line.startswith(('RC=', 'USERS\t', 'WHO\t')) or '\t' not in line:
+        return line
+    f = line.split('\t')
+    if len(f) < 7:
+        return line
+    return '\t'.join(f[:6] + [redact('\t'.join(f[6:]))])
+
+
+def wchan_cat(w):
+    if re.search(r'^nfs|nfs_|rpc_wait', w): return ('NFS/RPC', 'nfs')
+    if re.search(r'walk_component|d_alloc|lookup_slow|open_last_lookups|iterate_dir', w): return ('VFS·조회', 'nfs')
+    if re.search(r'page_bit|wait_on_buffer|jbd2|buffered_read|lock_page|nfs_start_io|submit_bio|io_schedule|blk', w): return ('디스크', 'disk')
+    if re.search(r'rwsem|mutex|down_', w): return ('lock', 'lock')
+    if re.search(r'cv_wait|cv_timedwait|txg', w): return ('ZFS', 'zfs')
+    return ('기타', 'etc')
+
+
+def human_age(sec):
+    if sec < 0: return '-'
+    d, r = divmod(sec, 86400); h, r = divmod(r, 3600); m, _ = divmod(r, 60)
+    if d: return f'{d}d {h}h'
+    if h: return f'{h}h {m}m'
+    if m: return f'{m}m'
+    return f'{sec}s'
+
+
+def short_cmd(args):
+    a = args.strip()
+    if a.startswith('['): return a.split()[0]
+    tok = a.split()
+    if not tok: return a
+    prog = tok[0].rsplit('/', 1)[-1]
+    if prog.startswith('git') and len(tok) > 1:
+        sub = next((t for t in tok[1:] if not t.startswith('-')), '')
+        return f'git {sub}'.strip()
+    if 'vscode-server' in a or 'server.bundle.js' in a: return 'vscode-server'
+    if 'cursor-server' in a: return 'cursor-server'
+    return prog
+
+
+def parse_proc(line):
+    f = line.split('\t')
+    if len(f) < 7: return None
+    stat, pid, ppid, user, et, wchan = f[0], f[1], f[2], f[3], f[4], f[5]
+    args = redact('\t'.join(f[6:]))
+    try: et = int(et)
+    except Exception: et = -1
+    quick = bool(QUICK_RE.match(args))
+    return {'stat': stat, 'pid': pid, 'user': user, 'etimes': et, 'wchan': wchan,
+            'args': args, 'quick': quick, 'stuck': quick and et > STUCK_AGE}
+
+
+def host_summary(name, h):
+    rc = h.get('rc')
+    procs, owners, logins = [], [], []
+    for ln in h.get('lines', []) or []:
+        if ln.startswith('RC='):
+            try: rc = int(ln[3:].strip())
+            except Exception: pass
+            continue
+        if ln.startswith('USERS\t'):
+            p = ln.split('\t')
+            if len(p) >= 3:
+                try: owners.append((int(p[1]), p[2]))
+                except Exception: pass
+            continue
+        if ln.startswith('WHO\t'):
+            p = ln.split('\t')
+            if len(p) >= 2 and p[1].strip(): logins.append(p[1].strip())
+            continue
+        if not ln.strip(): continue
+        pp = parse_proc(ln)
+        if pp: procs.append(pp)
+
+    # 주 사용자 랭킹: USERS(전체 프로세스) 우선, 없으면 D-state 소유자 폴백
+    if owners:
+        ranking = sorted(owners, reverse=True)
+        user_basis = 'proc'
+    else:
+        c = {}
+        for p in procs: c[p['user']] = c.get(p['user'], 0) + 1
+        ranking = sorted(((n, u) for u, n in c.items()), reverse=True)
+        user_basis = 'dstate'
+    main_user = ranking[0][1] if ranking else '-'
+
+    dcount = len(procs)
+    stuck = [p for p in procs if p['stuck']]
+    stuck_n = len(stuck)
+    oldest_stuck = max((p['etimes'] for p in stuck), default=-1)
+    cats = {}
+    for p in procs:
+        c, _ = wchan_cat(p['wchan']); cats[c] = cats.get(c, 0) + 1
+    top_cat = max(cats, key=cats.get) if cats else '-'
+
+    if rc == 124:
+        status, sev = 'PS_TIMEOUT', 4
+    elif rc not in (0, None):
+        status, sev = 'SCAN_ERR', 2
+    elif dcount == 0:
+        status, sev = 'OK', 0
+    else:
+        status = 'D'
+        disk_stall = any(DISK_STALL.search(p['wchan']) for p in procs)
+        if stuck_n >= RED_STUCK or dcount >= RED_DCOUNT or oldest_stuck > 3600: sev = 4
+        elif stuck_n >= ORANGE_STUCK or dcount >= ORANGE_DCOUNT or disk_stall: sev = 3
+        else: sev = 2
+        if disk_stall: top_cat = '디스크'
+
+    rep = max(stuck, key=lambda p: p['etimes'], default=None) or (max(procs, key=lambda p: p['etimes']) if procs else None)
+    return {'name': name, 'ansible_host': h.get('ansible_host', name), 'rc': rc,
+            'dcount': dcount, 'stuck_n': stuck_n, 'oldest_stuck': oldest_stuck,
+            'top_cat': top_cat, 'status': status, 'sev': sev,
+            'rep': short_cmd(rep['args']) if rep else '-', 'rep_user': rep['user'] if rep else '',
+            'main_user': main_user, 'ranking': ranking[:6], 'logins': logins[:8],
+            'user_basis': user_basis, 'procs': procs, 'cats': cats}
+
+
+SEV_CLASS = {0: 'ok', 2: 'warn', 3: 'high', 4: 'crit', 5: 'crit'}
+SEV_DOT = {0: 'ok', 2: 'warn', 3: 'high', 4: 'crit', 5: 'crit'}
+CAT_KEY = {'NFS/RPC': 'nfs', 'VFS·조회': 'nfs', '디스크': 'disk', 'lock': 'lock', 'ZFS': 'zfs'}
+
+
+def esc(x): return html.escape(str(x))
+
+
+def build(report):
+    hosts = report.get('hosts', {})
+    unreachable = sorted(report.get('unreachable', []) or [])
+    rows = [host_summary(n, h) for n, h in hosts.items()]
+    scanned = len(rows)
+    affected = sum(1 for r in rows if r['dcount'] > 0)
+    total_d = sum(r['dcount'] for r in rows)
+    total_stuck = sum(r['stuck_n'] for r in rows)
+
+    # fleet 카테고리
+    catall = {}
+    for r in rows:
+        for c, n in r['cats'].items(): catall[c] = catall.get(c, 0) + n
+    cat_total = sum(catall.values()) or 1
+    cat_sorted = sorted(catall.items(), key=lambda kv: -kv[1])
+    bars = ''.join(
+        f'<div class="bar"><span class="bk {CAT_KEY.get(c, "etc")}"></span>'
+        f'<span class="bn">{esc(c)}</span>'
+        f'<span class="btrack"><i class="bf {CAT_KEY.get(c, "etc")}" style="width:{max(3, round(n*100/cat_total))}%"></i></span>'
+        f'<span class="bv">{n}</span></div>'
+        for c, n in cat_sorted[:6]) or '<div class="muted">D-state 프로세스 없음</div>'
+
+    # fleet 활성 사용자
+    fu = {}
+    for r in rows:
+        for cnt, u in r['ranking']:
+            d = fu.setdefault(u, {'n': 0, 'hosts': 0})
+            d['n'] += cnt; d['hosts'] += 1
+    top_users = sorted(fu.items(), key=lambda kv: -kv[1]['n'])[:8]
+    umax = max((v['n'] for _, v in top_users), default=1)
+    users_panel = ''.join(
+        f'<div class="urow"><span class="un">{esc(u)}</span>'
+        f'<span class="utrack"><i style="width:{max(4, round(v["n"]*100/umax))}%"></i></span>'
+        f'<span class="uv">{v["n"]}<small>·{v["hosts"]}h</small></span></div>'
+        for u, v in top_users) or '<div class="muted">데이터 없음</div>'
+
+    rows.sort(key=lambda r: (-r['sev'], -r['stuck_n'], -r['dcount'], r['name']))
+
+    trs = []
+    for r in rows:
+        cls = SEV_CLASS.get(r['sev'], 'ok')
+        if r['procs']:
+            plist = ''.join(
+                f"<div class='p {'st' if p['stuck'] else ''}'>"
+                f"<span class='pg'>{esc(human_age(p['etimes']))}</span>"
+                f"<span class='pw'>{esc(p['wchan'])}</span>"
+                f"<span class='pu'>{esc(p['user'])}</span>"
+                f"<span class='pc'>{esc(p['args'][:280])}</span></div>"
+                for p in sorted(r['procs'], key=lambda p: (not p['stuck'], -p['etimes'])))
+            urank = ' · '.join(f"{esc(u)}({n})" for n, u in r['ranking']) or '-'
+            who = ' '.join(esc(x) for x in r['logins']) or '-'
+            det = (f"<details><summary>{r['dcount']}개 · 펼치기</summary>"
+                   f"<div class='meta2'>주 사용자: {urank}<br>로그인(WHO): {who}</div>"
+                   f"<div class='plist'>{plist}</div></details>")
+        else:
+            det = f"<span class='muted'>로그인: {' '.join(esc(x) for x in r['logins']) or '-'}</span>" if r['logins'] else '—'
+        trs.append(
+            f"<tr class='{cls}' data-host='{esc(r['name'])}' data-sev='{r['sev']}' "
+            f"data-stuck='{r['stuck_n']}' data-d='{r['dcount']}' data-age='{r['oldest_stuck']}'>"
+            f"<td class='st'><span class='dot {SEV_DOT.get(r['sev'])}'></span>{esc(r['status'])}</td>"
+            f"<td class='h'>{esc(r['name'])}<button class='rb' onclick=\"rescan(this,'{esc(r['name'])}')\" title='이 호스트만 지금 재스캔'>↻</button></td>"
+            f"<td class='ip'>{esc(r['ansible_host'])}</td>"
+            f"<td class='num'>{r['dcount'] or ''}</td>"
+            f"<td class='num sn'>{r['stuck_n'] or ''}</td>"
+            f"<td class='usr'>{esc(r['main_user']) if r['main_user'] != '-' else ''}</td>"
+            f"<td>{'<span class=chip data-k='+CAT_KEY.get(r['top_cat'],'etc')+'>'+esc(r['top_cat'])+'</span>' if r['dcount'] else ''}</td>"
+            f"<td class='num age'>{esc(human_age(r['oldest_stuck'])) if r['stuck_n'] else ''}</td>"
+            f"<td class='rep'>{esc(r['rep']) if r['dcount'] else ''}</td>"
+            f"<td class='det'>{det}</td></tr>")
+    for u in unreachable:
+        trs.append(
+            f"<tr class='crit unreach' data-host='{esc(u)}' data-sev='5' data-stuck='0' data-d='0' data-age='-1'>"
+            f"<td class='st'><span class='dot crit'></span>UNREACH</td><td class='h'>{esc(u)}</td>"
+            f"<td class='ip'>-</td><td class='num'></td><td class='num'></td><td class='usr'></td>"
+            f"<td><span class='chip' data-k='etc'>SSH 무응답</span></td><td class='num age'></td>"
+            f"<td class='rep'>꺼짐/네트워크/완전hang 확인</td><td class='det'>—</td></tr>")
+
+    health = 'crit' if (len(unreachable) or any(r['sev'] >= 4 for r in rows)) else ('high' if any(r['sev'] >= 3 for r in rows) else ('warn' if affected else 'ok'))
+    health_txt = {'ok': '정상', 'warn': '주의', 'high': '경고', 'crit': '위험'}[health]
+
+    return (HEAD + f"""
+<header>
+  <div class="brand"><span class="cur"></span>D-STATE<span class="b2"> FLEET</span>
+    <span class="hb {health}">● {health_txt}</span></div>
+  <div class="meta">{esc(report.get('source','-'))} · 스캔 <b>{esc(report.get('generated_at','-'))}</b> · 자동새로고침 5분 · 주기 {esc(report.get('interval_min',30))}분</div>
+</header>
+<section class="cards">
+  <div class="card"><div class="cl">스캔 호스트</div><div class="cv">{scanned}</div></div>
+  <div class="card warn"><div class="cl">D 발생</div><div class="cv">{affected}</div></div>
+  <div class="card crit"><div class="cl">도달불가</div><div class="cv">{len(unreachable)}</div></div>
+  <div class="card"><div class="cl">총 D 프로세스</div><div class="cv">{total_d}</div></div>
+  <div class="card crit"><div class="cl">확실히 stuck<span class="sub">즉시명령·2분+</span></div><div class="cv">{total_stuck}</div></div>
+</section>
+<section class="split">
+  <div class="panel"><div class="ph">원인 (wchan 카테고리)</div><div class="bars">{bars}</div></div>
+  <div class="panel"><div class="ph">활성 사용자 Top <span class="muted2">(프로세스/로그인 기준)</span></div><div class="users">{users_panel}</div></div>
+</section>
+<div class="tools"><input id="f" placeholder="🔎 호스트 필터 (예: web-01.example.com, compute)" oninput="flt()"><span id="cnt" class="muted2"></span></div>
+<table id="t"><thead><tr>
+<th onclick="srt('s',1)">상태</th><th onclick="srt('t',1)">호스트</th><th>IP</th>
+<th onclick="srt('d',0)" class="num">D수</th><th onclick="srt('k',0)" class="num">stuck</th>
+<th>주 사용자</th><th>원인</th><th onclick="srt('a',0)" class="num">최고령 stuck</th><th>대표 프로세스</th><th>상세</th>
+</tr></thead><tbody>
+{''.join(trs)}
+</tbody></table>
+<footer>⚠ "최고령 stuck" = 즉시 끝나야 할 명령(git/ls/du/sync)이 D로 머문 나이. 데몬의 큰 나이는 정상이라 제외. ·
+주 사용자 = 프로세스 최다 소유자(없으면 D-state 소유자). · 원인이 NFS/VFS면 NFS 서버·마운트, 디스크면 dmesg·smartctl·df. · D 프로세스는 kill 불가 → 근본원인 회복 필요.</footer>
+""" + SCRIPT)
+
+
+HEAD = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="300"><title>D-State Fleet Monitor</title>
+<style>
+:root{--bg:#0a0e14;--bg2:#0e1420;--pan:#111824;--pan2:#0f1622;--line:#1d2737;--line2:#2a3a52;
+--txt:#cdd8e6;--mut:#7889a0;--dim:#4a586b;--brand:#3fd0e6;--brandb:#1b6f7e;
+--ok:#42c98a;--warn:#e5c453;--high:#f0913e;--crit:#ff6168;
+--mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace}
+*{box-sizing:border-box}
+body{margin:0;background:
+ radial-gradient(900px 500px at 88% -8%,rgba(63,208,230,.07),transparent 60%),
+ radial-gradient(700px 400px at 0% 0%,rgba(63,208,230,.04),transparent 55%),var(--bg);
+ background-attachment:fixed;color:var(--txt);font-family:var(--mono);font-size:13px;line-height:1.5;
+ -webkit-font-smoothing:antialiased}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.5;
+ background-image:linear-gradient(rgba(120,137,160,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(120,137,160,.035) 1px,transparent 1px);
+ background-size:46px 46px}
+header,.cards,.split,.tools,table,footer{position:relative;z-index:1}
+header{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;
+ padding:18px 22px;border-bottom:1px solid var(--line)}
+.brand{font-size:18px;font-weight:700;letter-spacing:2px;color:var(--txt);display:flex;align-items:center;gap:6px}
+.brand .b2{color:var(--brand);font-weight:700}
+.brand .cur{width:9px;height:17px;background:var(--brand);display:inline-block;margin-right:4px;
+ box-shadow:0 0 10px var(--brand);animation:blink 1.3s steps(1) infinite}
+@keyframes blink{50%{opacity:.18}}
+.hb{font-size:11px;letter-spacing:1px;padding:2px 10px;border-radius:20px;margin-left:10px;border:1px solid}
+.hb.ok{color:var(--ok);border-color:#1e5e44;background:#0c1a14}
+.hb.warn{color:var(--warn);border-color:#5e5320;background:#181505}
+.hb.high{color:var(--high);border-color:#6e4420;background:#1a1206}
+.hb.crit{color:var(--crit);border-color:#6e2530;background:#1c0c0e;animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{50%{box-shadow:0 0 14px rgba(255,97,104,.5)}}
+.meta{color:var(--mut);font-size:11.5px}.meta b{color:var(--txt);font-weight:600}
+.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;padding:18px 22px 8px}
+.card{background:linear-gradient(180deg,var(--pan),var(--pan2));border:1px solid var(--line);
+ border-radius:10px;padding:14px 16px;position:relative;overflow:hidden;
+ animation:rise .5s both}
+.card::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--brandb)}
+.card.warn::before{background:var(--warn)}.card.crit::before{background:var(--crit)}
+.card .cl{color:var(--mut);font-size:11px;letter-spacing:.5px}.card .cl .sub{display:block;color:var(--dim);font-size:9.5px}
+.card .cv{font-size:30px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums}
+.card.crit .cv{color:var(--crit)}.card.warn .cv{color:var(--warn)}
+.cards .card:nth-child(2){animation-delay:.05s}.cards .card:nth-child(3){animation-delay:.1s}
+.cards .card:nth-child(4){animation-delay:.15s}.cards .card:nth-child(5){animation-delay:.2s}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}}
+.split{display:grid;grid-template-columns:1.3fr 1fr;gap:12px;padding:8px 22px 4px}
+.panel{background:var(--pan2);border:1px solid var(--line);border-radius:10px;padding:12px 16px;animation:rise .5s .15s both}
+.ph{color:var(--brand);font-size:11px;letter-spacing:1px;text-transform:uppercase;margin-bottom:10px}
+.muted2{color:var(--dim);text-transform:none;letter-spacing:0}
+.bar{display:grid;grid-template-columns:14px 84px 1fr 42px;align-items:center;gap:8px;padding:3px 0}
+.bk{width:9px;height:9px;border-radius:2px}.bn{color:var(--mut);font-size:11.5px}
+.btrack{height:7px;background:#0c1320;border-radius:4px;overflow:hidden;border:1px solid var(--line)}
+.bf{display:block;height:100%}.bv{text-align:right;color:var(--txt);font-variant-numeric:tabular-nums}
+.nfs{background:var(--brand)!important}.disk{background:var(--high)!important}.lock{background:#6aa6ff!important}
+.zfs{background:var(--ok)!important}.etc{background:var(--dim)!important}
+.bk.nfs{background:var(--brand)}.bk.disk{background:var(--high)}.bk.lock{background:#6aa6ff}.bk.zfs{background:var(--ok)}.bk.etc{background:var(--dim)}
+.users{display:flex;flex-direction:column;gap:5px}
+.urow{display:grid;grid-template-columns:130px 1fr 56px;align-items:center;gap:8px}
+.un{color:var(--txt);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.utrack{height:7px;background:#0c1320;border-radius:4px;overflow:hidden;border:1px solid var(--line)}
+.utrack i{display:block;height:100%;background:linear-gradient(90deg,var(--brandb),var(--brand))}
+.uv{text-align:right;color:var(--mut);font-variant-numeric:tabular-nums}.uv small{color:var(--dim)}
+.tools{padding:14px 22px 8px;display:flex;align-items:center;gap:12px}
+#f{background:var(--pan2);border:1px solid var(--line2);color:var(--txt);font-family:var(--mono);
+ padding:8px 12px;border-radius:8px;width:300px;outline:none}#f:focus{border-color:var(--brand)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{text-align:left;padding:7px 12px;border-bottom:1px solid #141d2a;vertical-align:top}
+th{position:sticky;top:0;background:rgba(10,14,20,.94);backdrop-filter:blur(4px);color:var(--mut);
+ font-weight:600;font-size:11px;letter-spacing:.5px;cursor:pointer;user-select:none;border-bottom:1px solid var(--line2)}
+th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
+tbody tr{border-left:3px solid transparent}
+tbody tr:hover{background:#0e1623}
+tr.ok{border-left-color:#1c2c22}
+tr.warn{border-left-color:var(--warn);background:rgba(229,196,83,.03)}
+tr.high{border-left-color:var(--high);background:rgba(240,145,62,.05)}
+tr.crit{border-left-color:var(--crit);background:rgba(255,97,104,.06)}
+td.h{font-weight:700;color:#e6eef8}td.ip{color:var(--dim)}
+td.usr{color:var(--brand)}td.rep{color:var(--mut);max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+td.sn{color:var(--crit);font-weight:700}td.age{color:var(--high)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:middle}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.high{background:var(--high)}
+.dot.crit{background:var(--crit);box-shadow:0 0 8px var(--crit)}
+.st{white-space:nowrap;font-size:11px;letter-spacing:.5px;color:var(--mut)}
+tr.crit .st{color:var(--crit)}tr.high .st{color:var(--high)}tr.warn .st{color:var(--warn)}tr.ok .st{color:var(--ok)}
+.chip{font-size:10.5px;padding:2px 8px;border-radius:12px;border:1px solid var(--line2);color:var(--mut);white-space:nowrap}
+.chip[data-k=nfs]{color:var(--brand);border-color:var(--brandb)}
+.chip[data-k=disk]{color:var(--high);border-color:#6e4420}
+.chip[data-k=lock]{color:#6aa6ff;border-color:#274a7a}
+.rb{margin-left:8px;background:#0d1828;border:1px solid var(--line2);color:var(--brand);border-radius:5px;
+ cursor:pointer;font-size:11px;padding:1px 7px;font-family:var(--mono)}.rb:hover{background:#13283c;box-shadow:0 0 8px rgba(63,208,230,.3)}
+details summary{cursor:pointer;color:var(--brand);font-size:11px;list-style:none}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:"▸ ";color:var(--dim)}details[open] summary::before{content:"▾ "}
+.meta2{color:var(--mut);font-size:11px;margin:6px 0;padding:6px 8px;background:#0c1320;border-radius:6px;border:1px solid var(--line)}
+.plist{margin:6px 0;max-height:360px;overflow:auto;border-left:2px solid var(--line2);padding-left:8px}
+.p{display:grid;grid-template-columns:64px 180px 116px 1fr;gap:8px;padding:2px 0;border-bottom:1px solid #0d141f;font-size:11px;color:var(--mut)}
+.p.st{color:#ffb9bc}.p .pg{color:var(--high);text-align:right}.p .pw{color:var(--brand)}.p .pu{color:var(--txt)}
+.muted{color:var(--dim)}
+footer{padding:14px 22px 30px;color:var(--dim);font-size:11px;border-top:1px solid var(--line);margin-top:8px;line-height:1.7}
+@media(max-width:860px){.cards{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}}
+</style></head><body>"""
+
+SCRIPT = """<script>
+function flt(){var q=document.getElementById('f').value.toLowerCase(),n=0,rs=document.querySelectorAll('#t tbody tr');
+rs.forEach(function(r){var m=r.getAttribute('data-host').toLowerCase().indexOf(q)>=0;r.style.display=m?'':'none';if(m)n++;});
+document.getElementById('cnt').textContent=n+' / '+rs.length;}
+var _sd={};
+function srt(key,txt){var tb=document.querySelector('#t tbody'),rs=[].slice.call(tb.querySelectorAll('tr'));
+var a={s:'data-sev',t:'data-host',d:'data-d',k:'data-stuck',a:'data-age'}[key];_sd[key]=!_sd[key];var dir=_sd[key]?1:-1;
+rs.sort(function(x,y){var vx=x.getAttribute(a),vy=y.getAttribute(a);return txt?dir*vx.localeCompare(vy):dir*((+vx)-(+vy));});
+rs.forEach(function(r){tb.appendChild(r);});}
+function rescan(btn,host){var o=btn.textContent;btn.textContent='…';btn.disabled=true;
+fetch('api/rescan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:host})})
+.then(function(r){return r.json();}).then(function(d){var tr=btn.closest('tr');
+if(d.error){btn.textContent='!';btn.title=d.error;btn.disabled=false;return;}
+if(d.unreachable){tr.querySelector('.st').innerHTML='<span class=\"dot crit\"></span>UNREACH';btn.textContent='↻';btn.disabled=false;return;}
+var lines=(d.data&&d.data.lines)||[],dc=lines.filter(function(l){return l.indexOf('\\t')>=0&&l.indexOf('USERS')!=0&&l.indexOf('WHO')!=0;}).length;
+var nc=tr.querySelector('.num');if(nc)nc.textContent=dc||'';btn.textContent='✓'+dc;btn.disabled=false;
+}).catch(function(e){btn.textContent='!';btn.title=''+e;btn.disabled=false;});}
+flt();
+</script></body></html>"""
+
+
+def main():
+    rp = sys.argv[1] if len(sys.argv) > 1 else 'report.json'
+    out = sys.argv[2] if len(sys.argv) > 2 else 'index.html'
+    with open(rp, encoding='utf-8') as f:
+        report = json.load(f)
+    with open(out, 'w', encoding='utf-8') as f:
+        f.write(build(report))
+    print(f"rendered {out} (hosts={len(report.get('hosts',{}))} unreachable={len(report.get('unreachable',[]))})")
+
+
+if __name__ == '__main__':
+    main()
